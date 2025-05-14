@@ -482,6 +482,32 @@ async def bookshelf_title_search(display_title: str) -> list:
                 logger.error(f'Error occured: {e}')
                 logger.error(traceback.print_exc())
 
+async def bookshelf_get_series_books(series_id):
+    """
+    Fetch all books in a series from Bookshelf API.
+    
+    :param series_id: The series ID to fetch books for
+    :return: List of books in the series, sorted by sequence number
+    """
+    endpoint = f"/series/{series_id}"
+    
+    try:
+        r = await bookshelf_conn(GET=True, endpoint=endpoint)
+        
+        if r.status_code != 200:
+            logger.error(f"Failed to fetch series details. Status: {r.status_code}")
+            return []
+            
+        data = r.json()
+        books = data.get('books', [])
+        
+        # Sort books by sequence number
+        sorted_books = sorted(books, key=lambda x: float(x.get('sequence', 0)))
+        
+        return sorted_books
+    except Exception as e:
+        logger.error(f"Error fetching series books: {e}")
+        return []
 
 async def bookshelf_search_users(name):
     endpoint = "/users"
