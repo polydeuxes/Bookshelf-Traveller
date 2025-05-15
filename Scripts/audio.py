@@ -14,8 +14,6 @@ import random
 # Import UI component functions
 from ui_components import (
     get_playback_rows,
-    get_series_playback_rows,
-    get_podcast_playback_rows,
     create_playback_embed
 )
 
@@ -85,6 +83,7 @@ class AudioPlayBack(Extension):
         self.currentTime = 0.0
         self.activeSessions = 0
         self.sessionOwner = None
+        self.repeat_enabled = False
         # Chapter VARS
         self.currentChapter = None
         self.chapterArray = None
@@ -116,7 +115,7 @@ class AudioPlayBack(Extension):
 
     @Task.create(trigger=IntervalTrigger(seconds=updateFrequency))
     async def session_update(self):
-        logger.info(f"Initializing Session Sync, current refresh rate set to: {updateFrequency} seconds")
+        logger.debug(f"Initializing Session Sync, current refresh rate set to: {updateFrequency} seconds")
         try:
             self.current_playback_time = self.current_playback_time + updateFrequency
 
@@ -134,10 +133,23 @@ class AudioPlayBack(Extension):
                 logger.info(f"Successfully synced session to updated time: {updatedTime} | "
                             f"Current Playback Time: {formatted_time} | session ID: {self.sessionID}")
 
-                # Check if book is finished
-                if finished_book:
-                    logger.info("Book playback has finished based on session update")
-                    # Could add special handling for finished books if problems occur
+                # Check if book is finished and repeat is enabled
+                if finished_book and self.repeat_enabled:
+                    logger.info("Book finished with repeat mode enabled - restarting from beginning")
+
+                    # Stop current session
+                    self.session_update.stop()
+                    await c.bookshelf_close_session(self.sessionID)
+                
+                     # Use existing logic to restart the book with startover=True
+                    if self.audio_context:
+                        await self.play_audio(self.audio_context, self.bookItemID, startover=True)
+                        return  # Exit early as play_audio will handle everything
+                    else:
+                        logger.warning("Cannot restart book: audio_context is None")
+
+                elif finished_book:
+                    logger.info("Book playback has finished, repeat mode not enabled")
 
             except TypeError as e:
                 logger.warning(f"Session update error: {e} - session may be invalid or closed")
@@ -207,15 +219,41 @@ class AudioPlayBack(Extension):
     # Random Functions ------------------------
     # Change Chapter Function
     async def move_chapter(self, option: str):
-        logger.info(f"executing command /next-chapter")
-        CurrentChapter = self.currentChapter
-        ChapterArray = self.chapterArray
+        logger.info(f"executing command /move_chapter")
+
+        # First, verify if CurrentChapter and ChapterArray exist and are valid
+        if not self.currentChapter or not self.chapterArray:
+            logger.warning("No chapter data available for this book. Cannot navigate chapters.")
+            self.found_next_chapter = False
+            return
+    
+        # Safely get the current chapter ID with proper error handling
+        try:
+            currentChapterID = int(self.currentChapter.get('id', -1))
+            if currentChapterID < 0:
+                logger.warning("Current chapter ID is invalid")
+                self.found_next_chapter = False
+                return
+        except (TypeError, ValueError) as e:
+            logger.error(f"Error processing chapter ID: {e}")
+            self.found_next_chapter = False
+            return
+
         bookFinished = self.bookFinished
+        nextChapterID = -1  # Initialize with a default value to avoid UnboundLocalError
 
         if not bookFinished:
-            currentChapterID = int(CurrentChapter.get('id'))
             if option == 'next':
                 nextChapterID = currentChapterID + 1
+
+            # If repeat enabled and we're at the last chapter, loop back to first chapter
+            if self.repeat_enabled:
+                # Check if there are no more chapters after this one
+                max_chapter_id = max([int(ch.get('id', -1)) for ch in self.chapterArray if ch.get('id') is not None], default=-1)
+                if nextChapterID > max_chapter_id:
+                    logger.info("End of book reached with repeat mode enabled - looping to first chapter")
+                    nextChapterID = 0  # First chapter typically has ID 0
+
             else:
                 nextChapterID = currentChapterID - 1
 
@@ -225,77 +263,90 @@ class AudioPlayBack(Extension):
                 # Just use the first chapter (index 0)
                 nextChapterID = 0
 
-            for chapter in ChapterArray:
-                chapterID = int(chapter.get('id'))
+            # Loop to find the right chapter in the array
+            found_chapter = False
+            for chapter in self.chapterArray:
+                try:
+                    chapterID = int(chapter.get('id'))
 
-                if nextChapterID == chapterID:
-                    self.session_update.stop()
-                    # self.terminal_clearer.stop()
-                    await c.bookshelf_close_session(self.sessionID)
-                    chapterStart = float(chapter.get('start'))
-                    self.newChapterTitle = chapter.get('title')
+                    if chapterID < 0:
+                        continue # Skip invalid chapters
 
-                    self.currentTime = chapterStart
+                    if nextChapterID == chapterID:
+                        self.session_update.stop()
+                        await c.bookshelf_close_session(self.sessionID)
+                        chapterStart = float(chapter.get('start', 0))
+                        self.newChapterTitle = chapter.get('title', 'Unknown Chapter')
 
-                    logger.info(f"Selected Chapter: {self.newChapterTitle}, Starting at: {chapterStart}")
+                        self.currentTime = chapterStart
 
-                    audio_obj, currentTime, sessionID, bookTitle, bookDuration = await c.bookshelf_audio_obj(
-                        self.bookItemID)
+                        logger.info(f"Selected Chapter: {self.newChapterTitle}, Starting at: {chapterStart}")
 
-                    self.sessionID = sessionID
-                    self.currentTime = currentTime
-                    self.bookDuration = bookDuration
+                        audio_obj, currentTime, sessionID, bookTitle, bookDuration = await c.bookshelf_audio_obj(
+                            self.bookItemID)
 
-                    self.currentChapter = chapter
-                    self.currentChapterTitle = chapter.get('title')
-                    logger.info(f"Updated current chapter to: {self.currentChapterTitle}")
+                        self.sessionID = sessionID
+                        self.currentTime = currentTime
+                        self.bookDuration = bookDuration
 
-                    audio = AudioVolume(audio_obj)
-                    audio.ffmpeg_before_args = f"-ss {chapterStart}"
-                    audio.ffmpeg_args = f"-ar 44100 -acodec aac -re"
-                    self.audioObj = audio
+                        self.currentChapter = chapter
+                        self.currentChapterTitle = chapter.get('title', 'Unknown Chapter')
+                        logger.info(f"Updated current chapter to: {self.currentChapterTitle}")
 
-                    # Set next time to new chapter time
-                    self.nextTime = chapterStart
+                        audio = AudioVolume(audio_obj)
+                        audio.ffmpeg_before_args = f"-ss {chapterStart}"
+                        audio.ffmpeg_args = f"-ar 44100 -acodec aac -re"
+                        self.audioObj = audio
 
-                    # Send manual next chapter sync with new session ID
-                    logger.info(f"Updating new session {sessionID} to position {chapterStart}")
-                    try:
-                        updatedTime, duration, serverCurrentTime, finished_book = await c.bookshelf_session_update(
-                            item_id=self.bookItemID, 
-                            session_id=self.sessionID,
-                            current_time=updateFrequency - 0.5, 
-                            next_time=self.nextTime)
+                        # Set next time to new chapter time
+                        self.nextTime = chapterStart
+
+                        # Send manual next chapter sync with new session ID
+                        logger.info(f"Updating new session {sessionID} to position {chapterStart}")
+                        try:
+                            updatedTime, duration, serverCurrentTime, finished_book = await c.bookshelf_session_update(
+                                item_id=self.bookItemID, 
+                                session_id=self.sessionID,
+                                current_time=updateFrequency - 0.5, 
+                                next_time=self.nextTime)
                     
-                        self.currentTime = updatedTime
-                        logger.info(f"Session update successful: {updatedTime}")
-                    except Exception as e:
-                        logger.error(f"Error updating session: {e}")
+                            self.currentTime = updatedTime
+                            logger.info(f"Session update successful: {updatedTime}")
+                        except Exception as e:
+                            logger.error(f"Error updating session: {e}")
 
-                    # Reset Next Time to None before starting task again
-                    self.nextTime = None
-                    logger.info(f"Verifying session ID is set to {self.sessionID} before starting update task")
+                        # Reset Next Time to None before starting task again
+                        self.nextTime = None
+                        logger.info(f"Verifying session ID is set to {self.sessionID} before starting update task")
 
-                    try:
-                        verified_chapter, _, _, _ = await c.bookshelf_get_current_chapter(
-                            item_id=self.bookItemID, current_time=chapterStart)
+                        try:
+                            verified_chapter, _, _, _ = await c.bookshelf_get_current_chapter(
+                                item_id=self.bookItemID, current_time=chapterStart)
                     
-                        if verified_chapter:
-                            verified_title = verified_chapter.get('title')
-                            logger.info(f"Server verified chapter title: {verified_title}")
+                            if verified_chapter:
+                                verified_title = verified_chapter.get('title', 'Unknown Chapter')
+                                logger.info(f"Server verified chapter title: {verified_title}")
                         
-                            # If there's a mismatch, update to the server's version
-                            if verified_title != self.currentChapterTitle:
-                                logger.warning(f"Chapter title mismatch! Local: {self.currentChapterTitle}, Server: {verified_title}")
-                                self.currentChapter = verified_chapter
-                                self.currentChapterTitle = verified_title
-                    except Exception as e:
-                        logger.error(f"Error verifying chapter info: {e}")
+                                # If there's a mismatch, update to the server's version
+                                if verified_title != self.currentChapterTitle:
+                                    logger.warning(f"Chapter title mismatch! Local: {self.currentChapterTitle}, Server: {verified_title}")
+                                    self.currentChapter = verified_chapter
+                                    self.currentChapterTitle = verified_title
+                        except Exception as e:
+                            logger.error(f"Error verifying chapter info: {e}")
 
-                    self.session_update.start()
+                        self.session_update.start()
 
-                    self.found_next_chapter = True
-                    return
+                        self.found_next_chapter = True
+                        return
+
+                except (TypeError, ValueError) as e:
+                    logger.warning(f"Error processing chapter {str(chapter)}: {e}")
+                    continue
+
+            # If no matching chapter found
+            logger.info(f"No {'next' if option == 'next' else 'previous'} chapter found")
+            self.found_next_chapter = False
 
     def modified_message(self, color, chapter):
         now = datetime.now(tz=timeZone)
@@ -363,6 +414,11 @@ class AudioPlayBack(Extension):
 
         logger.info(f"executing command /play")
 
+        # If current book is different from requested book, reset repeat state
+        if self.bookItemID != book:
+            logger.info(f"New book selected, resetting repeat mode")
+            self.repeat_enabled = False
+
         # Defer the response right away to prevent "interaction already responded to" errors
         await ctx.defer(ephemeral=True)
 
@@ -396,9 +452,12 @@ class AudioPlayBack(Extension):
             # Proceed with the normal playback flow using the book ID
             current_chapter, chapter_array, bookFinished, isPodcast = await c.bookshelf_get_current_chapter(item_id=book)
 
-            if current_chapter is None:
-                await ctx.send(content="Error retrieving chapter information. The item may be invalid or inaccessible.", ephemeral=True)
-                return
+            # Determine if we have valid chapter data
+            has_chapters = (current_chapter is not None and chapter_array and len(chapter_array) > 0)
+
+            if not has_chapters and not isPodcast:
+                logger.info("Book doesn't appear to have chapter information")
+                # We'll continue but won't show chapter buttons
 
             if isPodcast:
                 await ctx.send(content="The content you attempted to play is currently not supported, aborting.",
@@ -474,6 +533,9 @@ class AudioPlayBack(Extension):
             # Create embedded message
             embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
 
+            # Use the updated get_playback_rows function with has_chapters parameter
+#            ui_components = get_playback_rows("playing", has_chapters=has_chapters, is_podcast=isPodcast)
+
             # check if bot currently connected to voice
             if not ctx.voice_state:
                 # if we haven't already joined a voice channel
@@ -495,10 +557,26 @@ class AudioPlayBack(Extension):
                     if self.auto_kill_session.running:
                         self.auto_kill_session.stop()
 
+                    # Determine if this is part of a series (Needs additional implementation)
+                    is_series = False  # Need to implement logic to detect series
+                    is_first_in_series = False
+                    is_last_in_series = False
+
+                    # Use the unified UI component function
+                    ui_components = get_playback_rows(
+                        play_state="playing",
+                        has_chapters=has_chapters,
+                        is_podcast=isPodcast,
+                        is_series=is_series,
+                        is_first_in_series=is_first_in_series,
+                        is_last_in_series=is_last_in_series,
+                        repeat_enabled=self.repeat_enabled
+                    )
+
                     self.audio_message = await ctx.send(
                         content=start_message,
                         embed=embed_message,
-                        components=get_playback_rows("playing")
+                        components=ui_components
                     )
 
                     logger.info(f"Beginning audio stream" + (" from the beginning" if startover else ""))
@@ -570,29 +648,35 @@ class AudioPlayBack(Extension):
     @slash_option(name="option", description="Select 'next or 'previous' as options", opt_type=OptionType.STRING,
                   autocomplete=True, required=True)
     async def change_chapter(self, ctx, option: str):
-        if ctx.voice_state:
-            if self.isPodcast:
-                await ctx.send(content="Item type is not book, chapter skip disabled", ephemeral=True)
-                return
-
-            await self.move_chapter(option)
-
-            # Stop auto kill session task
-            if self.auto_kill_session.running:
-                logger.info("Stopping auto kill session backend task.")
-                self.auto_kill_session.stop()
-
-            await ctx.send(content=f"Moving to chapter: {self.newChapterTitle}", ephemeral=True)
-
-            await ctx.voice_state.play(self.audioObj)
-
-            if not self.found_next_chapter:
-                await ctx.send(content=f"Book Finished or No New Chapter Found, aborting",
-                               ephemeral=True)
-            # Resetting Variable
-            self.found_next_chapter = False
-        else:
+        if not ctx.voice_state:
             await ctx.send(content="Bot or author isn't connected to channel, aborting.", ephemeral=True)
+            return
+
+        if self.isPodcast:
+            await ctx.send(content="Item type is not book, chapter skip disabled", ephemeral=True)
+            return
+    
+        # Verify chapter data exists
+        if not self.currentChapter or not self.chapterArray:
+            await ctx.send(content="This book doesn't have chapter information available.", ephemeral=True)
+            return
+
+        # Proceed with chapter change
+        await self.move_chapter(option)
+
+        # Stop auto kill session task
+        if self.auto_kill_session.running:
+            logger.info("Stopping auto kill session backend task.")
+            self.auto_kill_session.stop()
+
+        if self.found_next_chapter:
+            await ctx.send(content=f"Moving to chapter: {self.newChapterTitle}", ephemeral=True)
+            await ctx.voice_state.play(self.audioObj)
+        else:
+            await ctx.send(content=f"Book Finished or No New Chapter Found, aborting", ephemeral=True)
+
+        # Resetting Variable
+        self.found_next_chapter = False
 
     @check(ownership_check)
     @slash_command(name="volume", description="change the volume for the bot", dm_permission=False)
@@ -627,6 +711,7 @@ class AudioPlayBack(Extension):
             self.current_playback_time = 0
             self.activeSessions -= 1
             self.sessionOwner = None
+            self.repeat_enabled = False  # Reset repeat mode when stopping
 
             # Stop auto kill session task
             if self.auto_kill_session.running:
@@ -881,7 +966,21 @@ class AudioPlayBack(Extension):
             logger.warning("Auto session kill task running... Checking for inactive session in 5 minutes!")
             self.auto_kill_session.start()
             embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
-            await ctx.edit_origin(content="Play", components=get_playback_rows("paused"), embed=embed_message)
+
+            # Get UI components with proper chapter button visibility
+            has_chapters = (self.currentChapter is not None and self.chapterArray and len(self.chapterArray) > 0)
+            is_series = False  # Need to implement logic to detect series
+
+            # Use the unified UI component function
+            ui_components = get_playback_rows(
+                play_state="paused",
+                has_chapters=has_chapters,
+                is_podcast=self.isPodcast,
+                is_series=is_series,
+                repeat_enabled=self.repeat_enabled
+            )
+
+            await ctx.edit_origin(content="Play", components=ui_components, embed=embed_message)
 
     @component_callback('play_audio_button')
     async def callback_play_button(self, ctx: ComponentContext):
@@ -897,7 +996,20 @@ class AudioPlayBack(Extension):
                 logger.info("Stopping auto kill session backend task.")
                 self.auto_kill_session.stop()
 
-            await ctx.edit_origin(components=get_playback_rows("playing"), embed=embed_message)
+            # Determine UI setup
+            has_chapters = (self.currentChapter is not None and self.chapterArray and len(self.chapterArray) > 0)
+            is_series = False  # Need to implement logic to detect series
+
+            # Use the unified UI component function
+            ui_components = get_playback_rows(
+                play_state="playing",
+                has_chapters=has_chapters,
+                is_podcast=self.isPodcast,
+                is_series=is_series,
+                repeat_enabled=self.repeat_enabled
+            )
+
+            await ctx.edit_origin(components=ui_components, embed=embed_message)
 
     @component_callback('next_chapter_button')
     async def callback_next_chapter_button(self, ctx: ComponentContext):
@@ -905,12 +1017,33 @@ class AudioPlayBack(Extension):
             logger.info('Moving to next chapter!')
             await ctx.defer(edit_origin=True)
 
+            # Verify chapter data exists first
+            if not self.currentChapter or not self.chapterArray:
+                await ctx.send(content="Chapter data isn't available for this book", ephemeral=True)
+                return
+
+            # Determine UI setup
+            has_chapters = True
+            is_series = False  # Need to implement logic to detect series
+
             if self.play_state == 'playing':
-                await ctx.edit_origin(components=get_playback_rows("playing"))
+                await ctx.edit_origin(components=get_playback_rows(
+                    play_state="playing",
+                    has_chapters=has_chapters,
+                    is_podcast=self.isPodcast,
+                    is_series=is_series,
+                    repeat_enabled=self.repeat_enabled
+                ))
                 ctx.voice_state.channel.voice_state.player.stop()
             elif self.play_state == 'paused':
-                await ctx.edit_origin(components=get_playback_rows("paused"))
-            ctx.voice_state.channel.voice_state.player.stop()
+                await ctx.edit_origin(components=get_playback_rows(
+                    play_state="paused",
+                    has_chapters=has_chapters,
+                    is_podcast=self.isPodcast,
+                    is_series=is_series,
+                    repeat_enabled=self.repeat_enabled
+                ))
+                ctx.voice_state.channel.voice_state.player.stop()
 
             # Find next chapter
             await self.move_chapter(option='next')
@@ -937,11 +1070,31 @@ class AudioPlayBack(Extension):
             logger.info('Moving to previous chapter!')
             await ctx.defer(edit_origin=True)
 
+            # Verify chapter data exists first
+            if not self.currentChapter or not self.chapterArray:
+                await ctx.send(content="Chapter data isn't available for this book", ephemeral=True)
+                return
+        
+            has_chapters = True
+            is_series = False  # Need to implement logic to detect series
+
             if self.play_state == 'playing':
-                await ctx.edit_origin(components=get_playback_rows("playing"))
+                await ctx.edit_origin(components=get_playback_rows(
+                    play_state="playing",
+                    has_chapters=has_chapters,
+                    is_podcast=self.isPodcast,
+                    is_series=is_series,
+                    repeat_enabled=self.repeat_enabled
+                ))
                 ctx.voice_state.channel.voice_state.player.stop()
             elif self.play_state == 'paused':
-                await ctx.edit_origin(components=get_playback_rows("paused"))
+                await ctx.edit_origin(components=get_playback_rows(
+                    play_state="paused",
+                    has_chapters=has_chapters,
+                    is_podcast=self.isPodcast,
+                    is_series=is_series,
+                    repeat_enabled=self.repeat_enabled
+                ))
                 ctx.voice_state.channel.voice_state.player.stop()
             else:
                 await ctx.send(content='Error with previous chapter command, bot not active or voice not connected!', ephemeral=True)
@@ -967,6 +1120,34 @@ class AudioPlayBack(Extension):
 
             else:
                 await ctx.send(content=f"Book Finished or No New Chapter Found, aborting", ephemeral=True)
+
+    @component_callback('toggle_repeat_button')
+    async def callback_toggle_repeat(self, ctx: ComponentContext):
+        if ctx.voice_state:
+            # Toggle repeat mode
+            self.repeat_enabled = not self.repeat_enabled
+            new_state = "ON" if self.repeat_enabled else "OFF"
+            logger.info(f'Toggled Repeat mode to: {new_state}')
+        
+            # Update the embedded message
+            embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
+        
+            # Determine UI setup
+            has_chapters = (self.currentChapter is not None and self.chapterArray and len(self.chapterArray) > 0)
+            is_series = False  # You would need to implement logic to detect series
+        
+            # Use the unified UI component function with updated repeat status
+            ui_components = get_playback_rows(
+                play_state=self.play_state,
+                has_chapters=has_chapters,
+                is_podcast=self.isPodcast,
+                is_series=is_series,
+                repeat_enabled=self.repeat_enabled
+            )
+        
+            await ctx.edit_origin(embed=embed_message, components=ui_components)
+        else:
+            await ctx.send(content="Bot is not connected to a voice channel.", ephemeral=True)
 
     @component_callback('stop_audio_button')
     async def callback_stop_button(self, ctx: ComponentContext):
@@ -1066,6 +1247,77 @@ class AudioPlayBack(Extension):
             self.auto_kill_session.stop()
 
         await ctx.edit_origin(embed=embed_message)
+        await ctx.voice_state.channel.voice_state.play(self.audioObj)  # NOQA
+
+    @component_callback('rewind_5m_button')
+    async def callback_rewind_5m_button(self, ctx: ComponentContext):
+        await ctx.defer(edit_origin=True)
+        ctx.voice_state.channel.voice_state.player.stop()
+
+        # Use the shared seek method for larger backward seeking (300 seconds = 5 minutes)
+        await self.shared_seek(300.0, is_forward=False)
+
+        # Start the session update task
+        self.session_update.start()
+
+        # Update the embedded message with new info
+        embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
+
+        # Stop auto kill session task
+        if self.auto_kill_session.running:
+            logger.info("Stopping auto kill session backend task.")
+            self.auto_kill_session.stop()
+
+        # Determine UI setup
+        has_chapters = (self.currentChapter is not None and self.chapterArray and len(self.chapterArray) > 0)
+        is_series = False  # Need to implement logic to detect series
+        
+        # Use the unified UI component function
+        ui_components = get_playback_rows(
+            play_state="playing",
+            has_chapters=has_chapters,
+            is_podcast=self.isPodcast,
+            is_series=is_series,
+            repeat_enabled=self.repeat_enabled
+        )
+
+        await ctx.edit_origin(embed=embed_message, components=ui_components)
+        await ctx.voice_state.channel.voice_state.play(self.audioObj)  # NOQA
+
+
+    @component_callback('forward_5m_button')
+    async def callback_forward_5m_button(self, ctx: ComponentContext):
+        await ctx.defer(edit_origin=True)
+        ctx.voice_state.channel.voice_state.player.stop()
+
+        # Use the shared seek method for larger forward seeking (300 seconds = 5 minutes)
+        await self.shared_seek(300.0, is_forward=True)
+
+        # Start the session update task
+        self.session_update.start()
+
+        # Update the embedded message with new info
+        embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
+
+        # Stop auto kill session task
+        if self.auto_kill_session.running:
+            logger.info("Stopping auto kill session backend task.")
+            self.auto_kill_session.stop()
+
+        # Determine UI setup
+        has_chapters = (self.currentChapter is not None and self.chapterArray and len(self.chapterArray) > 0)
+        is_series = False  # Need to implement logic to detect series
+        
+        # Use the unified UI component function
+        ui_components = get_playback_rows(
+            play_state="playing",
+            has_chapters=has_chapters,
+            is_podcast=self.isPodcast,
+            is_series=is_series,
+            repeat_enabled=self.repeat_enabled
+        )
+
+        await ctx.edit_origin(embed=embed_message, components=ui_components)
         await ctx.voice_state.channel.voice_state.play(self.audioObj)  # NOQA
 
     async def shared_seek(self, seek_amount, is_forward=True):

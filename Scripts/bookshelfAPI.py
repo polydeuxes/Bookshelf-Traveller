@@ -808,7 +808,7 @@ async def bookshelf_session_update(session_id: str, item_id: str, current_time: 
                         updatedTime = serverCurrentTime + current_time
                         print("Error, nextTime was not valid")
 
-                logger.info(
+                logger.debug(
                     f"Duration: {duration}, Current Time: {serverCurrentTime}, Updated Time: {updatedTime}")
 
                 # Check if session matches the current item playing
