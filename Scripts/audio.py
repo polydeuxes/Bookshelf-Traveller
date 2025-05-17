@@ -52,6 +52,37 @@ async def ownership_check(ctx: BaseContext):  # NOQA
         logger.info('ownership is disabled! skipping!')
         return True
 
+async def confirm_audio_volume(self):
+    """Ensures volume setting is maintained after playback begins"""
+    try:
+        # Initial wait to let playback start
+        await asyncio.sleep(0.2)
+        
+        # Check if playback is active
+        if not hasattr(self, 'audioObj') or not self.audioObj:
+            logger.warning("No audioObj found, cannot confirm volume")
+            return
+            
+        # Get the volume settings
+        current_vol = self.audioObj.volume
+        expected_vol = self.volume
+        
+        # Log the initial check
+        logger.info(f"Volume confirmation check - current: {current_vol * 100:.1f}%, expected: {expected_vol * 100:.1f}%")
+        
+        # If significant difference exists, fix it
+        if abs(current_vol - expected_vol) > 0.01:
+            logger.warning(f"Volume reset detected! Fixing from {current_vol * 100:.1f}% to {expected_vol * 100:.1f}%")
+            self.audioObj.volume = expected_vol
+            
+            # Wait a bit and check again to be sure
+            await asyncio.sleep(0.2)
+            final_vol = self.audioObj.volume
+            logger.info(f"After correction: volume is now {final_vol * 100:.1f}%")
+        else:
+            logger.info(f"Volume setting confirmed at {current_vol * 100:.1f}%")
+    except Exception as e:
+        logger.error(f"Error in confirm_audio_volume: {e}")
 
 async def time_converter(time_sec: int) -> str:
     """
@@ -72,6 +103,45 @@ async def time_converter(time_sec: int) -> str:
 
     return formatted_string
 
+class VolumeControlledAudio:
+    """
+    A wrapper around AudioVolume that maintains volume control.
+    This prevents the volume from being reset during playback initialization.
+    """
+    
+    def __init__(self, audio_obj, initial_volume=0.5):
+        self.audio = AudioVolume(audio_obj)
+        self._target_volume = initial_volume
+        
+        # Set initial volume
+        self.audio.volume = self._target_volume
+        logger.info(f"VolumeControlledAudio initialized with volume {self._target_volume * 100:.1f}%")
+        
+        # Hook the read method to enforce volume on every audio frame
+        self._original_read = self.audio.read
+        self.audio.read = self._volume_enforced_read
+    
+    def _volume_enforced_read(self, frame_size):
+        """Hook for the read method that ensures volume is maintained"""
+        # Check and fix volume if needed before reading data
+        if abs(self.audio.volume - self._target_volume) > 0.01:
+            logger.warning(f"Volume reset detected during read: {self.audio.volume * 100:.1f}% → {self._target_volume * 100:.1f}%")
+            self.audio.volume = self._target_volume
+        return self._original_read(frame_size)
+    
+    @property
+    def volume(self):
+        return self._target_volume
+    
+    @volume.setter
+    def volume(self, value):
+        self._target_volume = max(value, 0.0)
+        self.audio.volume = self._target_volume
+        logger.info(f"Volume set to {self._target_volume * 100:.1f}%")
+    
+    # Forward all other attributes to the underlying audio object
+    def __getattr__(self, name):
+        return getattr(self.audio, name)
 
 class AudioPlayBack(Extension):
     def __init__(self, bot):
@@ -85,6 +155,8 @@ class AudioPlayBack(Extension):
         self.currentTime = 0.0
         self.activeSessions = 0
         self.sessionOwner = None
+        self.book_volume_preferences = {}
+        self.default_volume = 0.5
         # Chapter VARS
         self.currentChapter = None
         self.chapterArray = None
@@ -99,7 +171,7 @@ class AudioPlayBack(Extension):
         self.current_playback_time = 0
         self.audio_context = None
         self.bitrate = 128000
-        self.volume = 0.0
+        self.volume = 0.5
         self.placeholder = None
         self.playbackSpeed = 1.0
         self.isPodcast = False
@@ -264,10 +336,8 @@ class AudioPlayBack(Extension):
                         self.currentChapterTitle = chapter.get('title', 'Unknown Chapter')
                         logger.info(f"Updated current chapter to: {self.currentChapterTitle}")
 
-                        audio = AudioVolume(audio_obj)
-                        audio.ffmpeg_before_args = f"-ss {chapterStart}"
-                        audio.ffmpeg_args = f"-ar 44100 -acodec aac -re"
-                        self.audioObj = audio
+                        # Build the audio stream with our centralized method
+                        self.audioObj = self.build_audio_stream(audio_obj, seek_position=chapterStart)
 
                         # Set next time to new chapter time
                         self.nextTime = chapterStart
@@ -363,6 +433,66 @@ class AudioPlayBack(Extension):
             timestamp=formatted_time,
             version=s.versionNumber
         )
+
+    def build_audio_stream(self, audio_obj, seek_position=None):
+        """
+        Build and configure a complete audio stream ready for playback.
+    
+        Parameters:
+        - audio_obj: The audio source object
+        - seek_position: Position to seek to in seconds (default: None)
+    
+        Returns:
+        - Fully configured AudioVolume object
+        """
+        logger.info(f"Building audio stream with seek position: {seek_position}")
+    
+        # Create the volume-controlled wrapper
+        audio = VolumeControlledAudio(audio_obj, initial_volume=self.volume)
+
+        # Log the default AudioVolume value
+        logger.info(f"Initial AudioVolume.volume value: {audio.volume * 100:.1f}%")
+
+        # Apply volume FIRST to ensure it takes effect before any playback
+#        audio.volume = self.volume
+#        logger.info(f"Set volume to {self.volume * 100:.1f}%")
+    
+        # Get book-specific volume if available, otherwise use default
+        if hasattr(self, 'book_volume_preferences') and self.bookItemID in self.book_volume_preferences:
+            book_volume = self.book_volume_preferences[self.bookItemID]
+            logger.info(f"Using saved volume preference for this book: {book_volume * 100:.1f}%")
+            # Update the class volume attribute first
+            self.volume = book_volume
+        else:
+            logger.info(f"No saved preference, using current volume: {self.volume * 100:.1f}%")
+
+        # Force set the volume on the audio object
+        audio.volume = self.volume
+        # Double-check that the volume was set correctly
+        logger.info(f"After setting: AudioVolume.volume = {audio.volume * 100:.1f}%, self.volume = {self.volume * 100:.1f}%")
+
+    
+        # Set buffer settings
+        audio.buffer_seconds = 5  # Consistent buffer size
+        audio.locked_stream = True
+    
+        # Apply seek position if provided
+        if seek_position is not None:
+            audio.ffmpeg_before_args = f"-ss {seek_position}"
+            logger.info(f"Set starting position to {seek_position} seconds")
+        else:
+            audio.ffmpeg_before_args = ""
+    
+        # Set consistent audio processing arguments
+        audio.ffmpeg_args = f"-ar 44100 -acodec aac -re"
+    
+        # Set bitrate
+        audio.bitrate = self.bitrate
+    
+        # Final volume check before returning
+        logger.info(f"Final check: AudioVolume.volume = {audio.volume * 100:.1f}%, self.volume = {self.volume * 100:.1f}%")
+    
+        return audio
 
     # Commands --------------------------------
 
@@ -461,14 +591,8 @@ class AudioPlayBack(Extension):
             # Retrieve current user information
             username, user_type, user_locked = await c.bookshelf_auth_test()
 
-            # Audio Object Arguments
-            audio = AudioVolume(audio_obj)
-            audio.buffer_seconds = 5
-            audio.locked_stream = True
-            self.volume = audio.volume
-            audio.ffmpeg_before_args = f"-ss {currentTime}"
-            audio.ffmpeg_args = f"-ar 44100 -acodec aac -re"
-            audio.bitrate = self.bitrate
+            # Build the audio object using our new centralized method
+            audio_stream = self.build_audio_stream(audio_obj, seek_position=currentTime)
 
             # Class VARS
 
@@ -482,7 +606,7 @@ class AudioPlayBack(Extension):
             self.sessionOwner = ctx.author.username
             self.bookItemID = book
             self.bookTitle = bookTitle
-            self.audioObj = audio
+            self.audioObj = audio_stream
             self.currentTime = currentTime
             self.current_playback_time = 0
             self.audio_context = ctx
@@ -535,8 +659,15 @@ class AudioPlayBack(Extension):
                     await self.client.change_presence(activity=Activity.create(name=f"{self.bookTitle}",
                                                                                type=ActivityType.LISTENING))
 
+                    # Just before starting playback, reconfirm volume setting
+                    current_volume = self.volume
+                    self.audioObj.volume = current_volume
+                    logger.info(f"Final volume check before playback: {self.audioObj.volume * 100:.1f}%")
+
                     # Start audio playback
-                    await ctx.voice_state.play(audio)
+                    await ctx.voice_state.play(self.audioObj)
+
+                    asyncio.create_task(confirm_audio_volume(self))
 
                 except Exception as e:
                     # Stop Any Associated Tasks
@@ -547,8 +678,8 @@ class AudioPlayBack(Extension):
                     # Cleanup discord interactions
                     if ctx.voice_state:
                         await ctx.author.voice.channel.disconnect()
-                    if audio:
-                        audio.cleanup()  # NOQA
+                    if self.audioObj:
+                        self.audioObj.cleanup()  # NOQA
 
                     logger.error(f"Error starting playback: {e}")
                     await ctx.send(content=f"Error starting playback: {str(e)}")
@@ -633,10 +764,16 @@ class AudioPlayBack(Extension):
                 volume_float = float(volume / 100)
                 audio.volume = volume_float
                 self.volume = audio.volume
+
+                # Save volume preference for this book
+                if self.bookItemID:
+                    self.book_volume_preferences[self.bookItemID] = self.volume
+                    logger.info(f"Saved volume preference for book {self.bookItemID}: {self.volume * 100:.1f}%")
+
                 await ctx.send(content=f"Volume set to: {volume}%", ephemaral=True)
 
             else:
-                await ctx.send(content=f"Invalid Entry", ephemeral=True)
+                await ctx.send(content=f"Invalid Entry - volume must be between 1 and 100", ephemeral=True)
         else:
             await ctx.send(content="Bot or author isn't connected to channel, aborting.", ephemeral=True)
 
@@ -1058,6 +1195,12 @@ class AudioPlayBack(Extension):
             audio.volume = self.volume + adjustment  # NOQA
             self.volume = audio.volume
 
+            # Save volume preference for this book
+            if self.bookItemID:
+                self.book_volume_preferences[self.bookItemID] = self.volume
+                logger.info(f"Saved volume preference for book {self.bookItemID}: {self.volume * 100:.1f}%")
+
+
             # Create embedded message
             embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
 
@@ -1069,21 +1212,48 @@ class AudioPlayBack(Extension):
         if ctx.voice_state and ctx.author.voice:
             adjustment = 0.1
 
+            # Log before values
+            logger.info(f"BEFORE volume adjustment: self.volume = {self.volume * 100:.1f}%, audioObj.volume = {self.audioObj.volume * 100:.1f}%")
+
             audio = self.audioObj
+            current_volume = audio.volume
+            new_volume = max(current_volume - adjustment, 0.0)  # Don't go below 0%
+        
+            logger.info(f"Setting volume from {current_volume * 100:.1f}% to {new_volume * 100:.1f}%")
+
+            audio.volume = new_volume
             self.volume = audio.volume
-            audio.volume = self.volume - adjustment  # NOQA
-            self.volume = audio.volume
+
+            # Log after values 
+            logger.info(f"AFTER volume adjustment: self.volume = {self.volume * 100:.1f}%, audioObj.volume = {self.audioObj.volume * 100:.1f}%")
+
+            # Save volume preference for this book
+            if self.bookItemID:
+                self.book_volume_preferences[self.bookItemID] = self.volume
+                logger.info(f"Saved volume preference for book {self.bookItemID}: {self.volume * 100:.1f}%")
+
 
             # Create embedded message
             embed_message = self.modified_message(color=ctx.author.accent_color, chapter=self.currentChapterTitle)
 
             await ctx.edit_origin(embed=embed_message)
-
             logger.info(f"Set Volume {round(self.volume * 100)}")  # NOQA
 
     @component_callback('forward_button')
     async def callback_forward_button(self, ctx: ComponentContext):
+        if not ctx.voice_state:
+            logger.warning("Voice state is None, cannot proceed with forward button")
+            await ctx.send("Error with playback controls. Please try stopping and starting again.", ephemeral=True)
+            return
+
         await ctx.defer(edit_origin=True)
+
+        # Make sure we have a valid voice state with a channel
+        if not ctx.voice_state.channel:
+            logger.warning("Voice channel is None, cannot proceed with forward button")
+            await ctx.send("Error with playback controls. Please try stopping and starting again.", ephemeral=True)
+            return
+
         ctx.voice_state.channel.voice_state.player.stop()
 
         # Use the unified method for forward seeking
@@ -1101,7 +1271,22 @@ class AudioPlayBack(Extension):
             self.auto_kill_session.stop()
 
         await ctx.edit_origin(embed=embed_message)
-        await ctx.voice_state.channel.voice_state.play(self.audioObj)  # NOQA
+
+        # Ensure volume is properly set before resuming playback
+        if self.audioObj:
+            self.audioObj.volume = self.volume
+            logger.info(f"Setting volume before resuming: {self.audioObj.volume * 100:.1f}%")
+
+        if ctx.voice_state and ctx.voice_state.channel:
+            # Ensure volume is properly set before resuming playback
+            self.audioObj.volume = self.volume
+            logger.info(f"Setting volume before resuming: {self.audioObj.volume * 100:.1f}%")
+
+        if ctx.voice_state and ctx.voice_state.channel:
+            await ctx.voice_state.channel.voice_state.play(self.audioObj)
+        else:
+            logger.warning("Voice state or channel became None, cannot resume playback")
+            await ctx.send("Error resuming playback. Please try stopping and starting again.", ephemeral=True)
 
     @component_callback('rewind_button')
     async def callback_rewind_button(self, ctx: ComponentContext):
@@ -1123,7 +1308,15 @@ class AudioPlayBack(Extension):
             self.auto_kill_session.stop()
 
         await ctx.edit_origin(embed=embed_message)
-        await ctx.voice_state.channel.voice_state.play(self.audioObj)  # NOQA
+
+        if ctx.voice_state and ctx.voice_state.channel:
+            # Ensure volume is properly set before resuming playback
+            self.audioObj.volume = self.volume
+            logger.info(f"Setting volume before resuming: {self.audioObj.volume * 100:.1f}%")
+            await ctx.voice_state.channel.voice_state.play(self.audioObj)
+        else:
+            logger.warning("Voice state or channel is None, cannot resume playback")
+            await ctx.send("Error resuming playback. Please try stopping and starting again.", ephemeral=True)
 
     async def shared_seek(self, seek_amount, is_forward=True):
         """
@@ -1235,14 +1428,22 @@ class AudioPlayBack(Extension):
         # Update the current time to match where we're seeking
         self.currentTime = self.nextTime
 
-        # Prepare audio object
-        audio = AudioVolume(audio_obj)
-        audio.ffmpeg_before_args = f"-ss {self.nextTime}"
-        audio.ffmpeg_args = f"-ar 44100 -acodec aac"
+        # Build the audio stream
+        self.audioObj = self.build_audio_stream(audio_obj, seek_position=self.nextTime)
 
-        # Send manual session sync
-        await c.bookshelf_session_update(item_id=self.bookItemID, session_id=self.sessionID,
-                                    current_time=updateFrequency - 0.5, next_time=self.nextTime)
+        next_time_to_send = self.nextTime
+        self.nextTime = None
+
+        # Send manual session sync - modify this line to explicitly send the target position
+        updatedTime, duration, serverCurrentTime, finished_book = await c.bookshelf_session_update(
+            item_id=self.bookItemID, 
+            session_id=self.sessionID,
+            current_time=0,  # Don't add time - we're syncing to an explicit position
+            next_time=next_time_to_send)  # Send the target position
+
+        # Update the time with server response
+        self.currentTime = updatedTime
+        logger.info(f"Session updated to position: {updatedTime}")
 
         # Do an explicit check to make sure we have the latest chapter info
         # This is especially important after moving across chapter boundaries
@@ -1258,10 +1459,24 @@ class AudioPlayBack(Extension):
             except Exception as e:
                 logger.error(f"Error in final chapter verification: {e}")
 
-        self.audioObj = audio
+        # Add a small hook to ensure the volume is properly applied when playback begins
+        def _ensure_volume_applied(frame_size):
+            """Hook function to ensure volume is applied when audio is first read"""
+            data = original_read(frame_size)
+            # After the first read, restore the original method
+            self.audioObj.read = original_read
+            logger.info(f"Audio playback started - confirming volume setting: {self.volume * 100:.1f}%")
+            return data
+
+        # Save the original read method
+        original_read = self.audioObj.read
+        # Override with our hook that will run once
+        self.audioObj.read = _ensure_volume_applied
+
+#        self.audioObj = audio
         self.nextTime = None
 
-        return audio
+        return self.audioObj
 
     # ----------------------------
     # Other non discord related functions
